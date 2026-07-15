@@ -1,0 +1,55 @@
+# ============================================================
+# 智能座舱多模态交互终端 — Python 依赖
+# 适配 Windows 开发环境，后续迁移至 LoongArch
+# ============================================================
+
+# ----- 音频处理 -----
+pyaudio==0.2.14
+webrtcvad==2.0.10
+soundfile>=0.12.0
+librosa>=0.10.0
+numpy>=1.24.0
+scipy>=1.11.0
+
+# ----- 语音识别 (ASR) -----
+# Whisper 端侧ASR (faster-whisper 比 openai-whisper 更快)
+faster-whisper>=1.0.0
+openai-whisper>=20231117
+
+# ----- 语音合成 (TTS) -----
+edge-tts>=6.1.0          # Windows 免费 TTS
+# pyttsx3>=2.90            # 离线 TTS 备选
+
+# ----- NLP / NLU -----
+transformers>=4.40.0
+sentence-transformers>=2.7.0
+jieba>=0.42.0
+pytorch>=2.0.0
+onnxruntime>=1.17.0       # 跨平台推理（LoongArch 需源码编译）
+
+# ----- LLM 推理 -----
+# llama-cpp-python>=0.2.0  # llama.cpp Python 绑定 (LoongArch 需编译)
+# 注意: llama-cpp-python 在 Windows 上可直接 pip install，
+# LoongArch 上需从源码编译并指定 LoongArch 架构
+
+# ----- 计算机视觉 -----
+opencv-python>=4.9.0
+mediapipe>=0.10.8         # 面部关键点 / 姿态估计
+dlib>=19.24.0             # 面部特征点 (Windows 可用，LoongArch 需源码编译)
+face-recognition>=1.3.0
+
+# ----- 异步与通信 -----
+pyzmq>=25.1.0             # 事件总线
+asyncio (内置)
+websockets>=12.0
+
+# ----- Web UI (Demo) -----
+gradio>=4.20.0            # 快速构建演示界面
+# streamlit>=1.30.0
+
+# ----- 工具 -----
+pydantic>=2.6.0
+loguru>=0.7.0
+python-dotenv>=1.0.0
+rich>=13.0.0              # 终端美化输出
+psutil>=5.9.0
