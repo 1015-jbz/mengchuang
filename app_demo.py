@@ -36,10 +36,26 @@ try:
     import cv2
     _CASCADE_PATH = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
     _face_cascade = cv2.CascadeClassifier(_CASCADE_PATH)
+    _smile_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_smile.xml")
+    _lefteye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_lefteye_2splits.xml")
+    _righteye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_righteye_2splits.xml")
     HAS_CV2 = True
-    logger.info("OpenCV 人脸检测就绪")
+    logger.info("OpenCV 多级联检测器就绪 (人脸+微笑+左眼+右眼)")
+    # ONNX 深度学习表情识别模型
+    _ort_session = None
+    _ort_labels = None
+    _ort_input_size = 260
+    _model_path = Path(__file__).resolve().parent / "models" / "enet_b2_7.onnx"
+    if _model_path.exists():
+        import onnxruntime as _ort
+        _ort_session = _ort.InferenceSession(str(_model_path), providers=['CPUExecutionProvider'])
+        _ort_labels = {0: 'angry', 1: 'disgusted', 2: 'fearful', 3: 'happy', 4: 'neutral', 5: 'sad', 6: 'surprised'}
+        logger.info(f"ONNX 表情识别模型已加载: enet_b2_7 (260x260, 7类)")
+    else:
+        logger.info("ONNX 模型未下载，使用启发式。FDM 下载后放到 models/enet_b2_7.onnx 即可")
 except Exception as e:
     _face_cascade = None
+    _smile_cascade = None
     HAS_CV2 = False
     logger.warning(f"OpenCV 不可用: {e}")
 
@@ -99,74 +115,145 @@ EMOTION_ZH = {
     "disgusted": "厌恶",
 }
 
+# 基线校准系统 — LBP 纹理特征基线
+_baseline = None
+_baseline_count = 0
+_BASELINE_FRAMES = 60
+
+def _onnx_predict_emotion(face_rgb):
+    """深度学习表情识别 — ONNX EfficientNet-B2"""
+    img = cv2.resize(face_rgb, (_ort_input_size, _ort_input_size)) / 255.0
+    img[..., 0] = (img[..., 0] - 0.485) / 0.229
+    img[..., 1] = (img[..., 1] - 0.456) / 0.224
+    img[..., 2] = (img[..., 2] - 0.406) / 0.225
+    x = img.transpose(2, 0, 1).astype('float32')[np.newaxis, ...]
+    scores = _ort_session.run(None, {'input': x})[0][0]
+    e_x = np.exp(scores - np.max(scores))
+    probs = e_x / e_x.sum()
+    pred = int(np.argmax(probs))
+    return _ort_labels[pred], float(probs[pred])
+
+def _extract_face_features(face_img_rgb):
+    """提取面部特征向量（含级联检测器特征）"""
+    gray = cv2.cvtColor(face_img_rgb, cv2.COLOR_RGB2GRAY)
+    h, w = gray.shape
+    # 嘴部
+    mouth_roi = gray[2*h//3:, w//6:5*w//6]
+    _, mt = cv2.threshold(mouth_roi, 70, 255, cv2.THRESH_BINARY_INV)
+    dark_ratio = float(np.sum(mt == 255) / max(mt.size, 1))
+    mouth_contrast = float(mouth_roi.std())
+    left = gray[2*h//3:, :w//3]
+    right = gray[2*h//3:, 2*w//3:]
+    mouth_asym = abs(float(left.std()) - float(right.std()))
+    # 眉心竖纹 (Sobel 垂直边缘)
+    glabella = gray[h//8:3*h//8, w//3:2*w//3]
+    sobel_x = cv2.Sobel(glabella, cv2.CV_64F, 1, 0, ksize=3)
+    sobel_y = cv2.Sobel(glabella, cv2.CV_64F, 0, 1, ksize=3)
+    vertical = np.abs(sobel_x) - np.abs(sobel_y) * 0.5
+    brow = float(np.sum(vertical > 40) / max(vertical.size, 1))
+    # 眼睛大小（级联检测器检测到的眼睛面积）
+    upper_face = gray[:h//2, :]
+    le = _lefteye_cascade.detectMultiScale(upper_face, 1.1, 3, minSize=(15, 10))
+    re = _righteye_cascade.detectMultiScale(upper_face, 1.1, 3, minSize=(15, 10))
+    eye_area = 0.0
+    if len(le) > 0 and len(re) > 0:
+        # 取最大检测框面积
+        le_area = max(e[2]*e[3] for e in le)
+        re_area = max(e[2]*e[3] for e in re)
+        eye_area = float((le_area + re_area) / 2) / (w * h)  # 归一化
+    # 全局
+    fmean = float(gray.mean())
+    fstd = float(gray.std())
+    return dark_ratio, mouth_asym, mouth_contrast, brow, fmean, fstd, eye_area
+
+_last_onnx_result = ("neutral", 0.5)
+_onnx_frame_counter = 0
+
 def detect_emotion_from_landmarks(face_img_rgb, frame_w, frame_h):
+    # 深度学习模型优先（每5帧推理一次，其余用缓存）
+    global _last_onnx_result, _onnx_frame_counter
+    if _ort_session is not None:
+        _onnx_frame_counter += 1
+        if _onnx_frame_counter % 5 == 0:
+            _last_onnx_result = _onnx_predict_emotion(face_img_rgb)
+        return _last_onnx_result
     """
-    使用 MediaPipe 468 点面部关键点精准识别表情。
+    基于个人基线的表情识别 —— 相对变化远优于绝对阈值。
 
-    基于面部动作编码系统 (FACS):
-    - 嘴角上扬 → 开心 (AU12)
-    - 眉毛下压 + 嘴唇紧闭 → 愤怒 (AU4+AU23)
-    - 眉毛上扬 + 嘴张大 → 惊讶 (AU1+AU2+AU26)
-    - 嘴角下垂 → 悲伤 (AU15)
-    - 眉毛上扬+眉头皱起 → 恐惧 (AU1+AU2+AU4)
-    - 眼睑下垂 → 疲倦
+    启动时自动采集平静脸建立基线，之后每帧与基线对比，
+    检测特征偏离来判断表情。对不同人脸/光照自适应。
     """
-    if not HAS_MEDIAPIPE or _face_mesh is None:
-        # === 增强启发式：基于面部区域分析 ===
-        gray = cv2.cvtColor(face_img_rgb, cv2.COLOR_RGB2GRAY)
-        h, w = gray.shape
+    global _baseline, _baseline_count
 
-        # 1. 嘴部区域：判断张嘴/微笑
-        mouth_roi = gray[2*h//3:, w//6:5*w//6]
-        # 自适应阈值找口腔暗区（张嘴时口腔内很暗）
-        _, mouth_thresh = cv2.threshold(mouth_roi, 60, 255, cv2.THRESH_BINARY_INV)
-        dark_ratio = np.sum(mouth_thresh == 255) / mouth_thresh.size
-        mouth_contrast = float(mouth_roi.std())
+    # 提取当前特征
+    dark, asym, mcon, brow, fmean, fstd, eye_area = _extract_face_features(face_img_rgb)
 
-        # 2. 眼部+眉毛区域：判断眉毛下压(愤怒)或上扬(惊讶)
-        upper_roi = gray[:h//3, :]  # 上三分之一
-        upper_edges = cv2.Canny(upper_roi, 50, 150)
-        brow_furrow = np.sum(upper_edges > 0) / upper_edges.size  # 眉毛纹理密度
-        upper_std = float(upper_roi.std())
-
-        # 3. 左嘴角 + 右嘴角区域：判断上扬/下垂
-        left_mouth = gray[3*h//5:, :w//3]
-        right_mouth = gray[3*h//5:, 2*w//3:]
-        lm_std = float(left_mouth.std())
-        rm_std = float(right_mouth.std())
-        mouth_asym = abs(lm_std - rm_std)  # 不对称 = 表情活跃
-
-        # 4. 全局特征
-        face_std = float(gray.std())
-        face_mean = float(gray.mean())
-
-        # === 基于真实人脸数据校准的阈值 ===
-        # 平静脸: dark=0.005~0.025, mouth_contrast=18~22, mouth_asym=5~12
-        # 张嘴:   dark>0.035, mouth_contrast>24
-        # 微笑:   mouth_asym>13, dark<0.035 (嘴不对称但不大张)
-        # 皱眉:   结合 brow 和 face_std
-
-        # 惊讶 — 大张嘴
-        if dark_ratio > 0.035:
-            return "surprised", min(0.9, dark_ratio * 15)
-
-        # 开心 — 嘴角不对称(微笑拉扯) + 不太张嘴
-        if mouth_asym > 13 and dark_ratio < 0.03:
-            return "happy", min(0.85, 0.5 + mouth_asym * 0.02)
-
-        # 开心弱版 — 微微笑
-        if mouth_asym > 10 and dark_ratio > 0.02 and dark_ratio < 0.03:
-            return "happy", 0.55
-
-        # 愤怒 — 眉毛纹理高 (#暂无明显特征，用脸对比度+眉毛组合)
-        if brow_furrow > 0.08 and face_std > 30:
-            return "angry", 0.55
-
-        # 悲伤 — 面部偏暗 (face_mean < 110)
-        if face_mean < 110 and face_std < 27:
-            return "sad", 0.5
-
+    # 建立基线（前 N 帧平均）
+    if _baseline_count < _BASELINE_FRAMES:
+        if _baseline is None:
+            _baseline = (dark, asym, mcon, brow, fmean, fstd, eye_area)
+        else:
+            w = _baseline_count / (_baseline_count + 1)
+            _baseline = (
+                _baseline[0] * w + dark * (1-w),
+                _baseline[1] * w + asym * (1-w),
+                _baseline[2] * w + mcon * (1-w),
+                _baseline[3] * w + brow * (1-w),
+                _baseline[4] * w + fmean * (1-w),
+                _baseline[5] * w + fstd * (1-w),
+                _baseline[6] * w + eye_area * (1-w),
+            )
+        _baseline_count += 1
+        if _baseline_count == _BASELINE_FRAMES:
+            logger.info(f"基线建立完成: dark={_baseline[0]:.4f} asym={_baseline[1]:.2f} "
+                        f"mcon={_baseline[2]:.1f} brow={_baseline[3]:.4f} eye={_baseline[6]:.4f}")
         return "neutral", 0.5
+
+    # 与基线对比，计算变化差值
+    bdark, basym, bmcon, bbrow, bmean, bstd, beye = _baseline
+
+    dark_delta = dark - bdark
+    asym_delta = asym - basym
+    brow_delta = brow - bbrow
+    mcon_delta = mcon - bmcon
+    fmean_delta = fmean - bmean
+    eye_delta = eye_area - beye    # 眼睛面积变化 → 睁大/眯眼
+
+    # === 多级联检测器融合（Haar + 像素特征）===
+    h, w = face_img_rgb.shape[:2]
+    eyes_wide = eye_delta > 0.002       # 眼睛明显睁大
+    eyes_narrow = eye_delta < -0.001    # 眼睛明显变小
+    mouth_open = dark_delta > 0.008     # 嘴明显张开(大)
+    mouth_slight = dark_delta > 0.003   # 嘴微张
+    brow_furrowed = brow_delta > 0.008  # 眉心明显竖纹
+    face_dark = fmean_delta < -8        # 面部明显变暗
+
+    # 😊 开心 — smile cascade（级联模型，最可靠）
+    if _smile_cascade is not None:
+        gray_lower = cv2.cvtColor(face_img_rgb[h//2:, :], cv2.COLOR_RGB2GRAY)
+        for sf, mn in [(1.3, 15), (1.5, 10), (1.8, 8)]:
+            smiles = _smile_cascade.detectMultiScale(
+                gray_lower, sf, mn, minSize=(20, 15), maxSize=(w//2, h//3))
+            if len(smiles) > 0:
+                return "happy", 0.8
+
+    # 😲 惊讶 — 嘴大张 + 眼睛睁大 + 眉心不皱(眉毛上扬)
+    if mouth_open and eyes_wide and not brow_furrowed:
+        return "surprised", min(0.9, 0.4 + dark_delta * 30 + eye_delta * 40)
+
+    # 😨 恐惧 — 眼睛睁大 + 嘴微张 + 眉心可能皱（区别于惊讶）
+    if eyes_wide and mouth_slight and not mouth_open:
+        return "fearful", min(0.75, 0.3 + eye_delta * 50)
+
+    # 😤 愤怒 — 眉心竖纹 + 眼睛不睁大 + 嘴不大张
+    if brow_furrowed and not eyes_wide and not mouth_open:
+        return "angry", min(0.8, 0.3 + brow_delta * 15)
+
+    # 😢 悲伤 — 面部变暗 + 眼睛变小 + 嘴不张
+    if face_dark and eyes_narrow and not mouth_open:
+        return "sad", min(0.7, 0.3 + abs(fmean_delta) * 0.02)
+
+    return "neutral", 0.5
 
     results = _face_mesh.process(face_img_rgb)
     if not results.multi_face_landmarks:
@@ -284,13 +371,19 @@ def _capture_loop():
 
                 color = EMOTION_COLORS.get(emotion, (180, 180, 180))
                 label = f"{EMOTION_ZH.get(emotion, emotion)} ({conf:.0%})"
-                # 画框
-                cv2.rectangle(annotated, (x, y), (x+fw, y+fh), color, 2)
-                # 画标签
-                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                cv2.rectangle(annotated, (x, y-th-10), (x+tw+10, y), color, -1)
+                # 画框（加粗）
+                cv2.rectangle(annotated, (x, y), (x+fw, y+fh), color, 3)
+                # 画标签 — 大号粗体醒目
+                font = cv2.FONT_HERSHEY_DUPLEX
+                scale = 1.2
+                thick = 3
+                (tw, th), baseline = cv2.getTextSize(label, font, scale, thick)
+                # 标签背景
+                cv2.rectangle(annotated, (x-3, y-th-20), (x+tw+15, y+5), color, -1)
+                # 标签文字（黑色在亮色背景上，白色在暗色背景上）
+                text_color = (0, 0, 0) if sum(color) > 400 else (255, 255, 255)
                 cv2.putText(annotated, label, (x+5, y-5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                            font, scale, text_color, thick)
         else:
             # 降级：OpenCV Haar Cascade
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -304,10 +397,14 @@ def _capture_loop():
 
                 color = EMOTION_COLORS.get(emotion, (180, 180, 180))
                 label = f"{EMOTION_ZH.get(emotion, emotion)} ({conf:.0%})"
-                cv2.rectangle(annotated, (x, y), (x+fw, y+fh), color, 2)
-                cv2.rectangle(annotated, (x, y-30), (x+len(label)*12, y), color, -1)
-                cv2.putText(annotated, label, (x+5, y-8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+                font = cv2.FONT_HERSHEY_DUPLEX
+                scale = 1.2; thick = 3
+                cv2.rectangle(annotated, (x, y), (x+fw, y+fh), color, 3)
+                (tw, th), _ = cv2.getTextSize(label, font, scale, thick)
+                cv2.rectangle(annotated, (x-3, y-th-20), (x+tw+15, y+5), color, -1)
+                text_color = (0, 0, 0) if sum(color) > 400 else (255, 255, 255)
+                cv2.putText(annotated, label, (x+5, y-5),
+                            font, scale, text_color, thick)
 
         # 编码为 JPEG
         _, jpeg = cv2.imencode('.jpg', annotated, [cv2.IMWRITE_JPEG_QUALITY, 70])
