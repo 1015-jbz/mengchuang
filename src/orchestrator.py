@@ -94,8 +94,16 @@ class CockpitOrchestrator:
         """主运行循环"""
         self.running = True
 
-        # 启动后台任务
+        # 模拟点火信号，使 is_driving 状态机生效（真实部署应由 CAN 总线接入发布）
+        await self.event_bus.publish(Event(
+            type="vehicle.state_changed",
+            data={"key": "ignition", "value": "on"},
+            source="orchestrator",
+        ))
+
+        # 启动后台任务（事件总线分发循环必须启动，否则 publish 的事件永远无人消费）
         tasks = [
+            asyncio.create_task(self.event_bus.start()),
             asyncio.create_task(self.speech.listen_loop()),
             asyncio.create_task(self.safety.monitor_loop()),
             asyncio.create_task(self.emotion.track_loop()),
@@ -111,6 +119,7 @@ class CockpitOrchestrator:
     async def shutdown(self):
         """优雅关闭"""
         self.running = False
+        self.event_bus.stop()
         engines = [self.speech, self.llm, self.safety, self.emotion, self.controller]
         for engine in engines:
             if engine:
@@ -199,9 +208,9 @@ class CockpitOrchestrator:
         elif domain == "影音娱乐":
             return await self.controller.execute_entertainment(intent_name, slots)
 
-        # 默认：LLM 对话
+        # 默认：LLM 对话（传用户原话；多模态状态标签放进 system prompt）
         return await self.llm.generate_response(
-            fused_context.get("conversation_context", ""),
+            fused_context.get("text", ""),
             system_prompt=self._build_system_prompt(fused_context)
         )
 
@@ -219,7 +228,9 @@ class CockpitOrchestrator:
 
         # 联动车辆控制
         if alert_type == "fatigue" and alert_level == "critical":
-            await self.controller.suggest_rest_area()
+            rest_area = await self.controller.suggest_rest_area()
+            if rest_area:
+                await self.speech.speak(f"建议尽快休息：{rest_area}")
 
         # 更新多模态融合状态
         await self.fusion.update_safety_alert(event.data)
@@ -295,6 +306,7 @@ class CockpitOrchestrator:
 - 时间: {time_str}
 - 车辆状态: {driving_status}
 - 驾驶员情绪: {emotion}
+- 场景标记: {fused_context.get('conversation_context') or '无'}
 
 你的角色特点：
 1. 温暖贴心 — 像一位懂你的伙伴，不只是执行命令

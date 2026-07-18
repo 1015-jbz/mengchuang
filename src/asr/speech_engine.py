@@ -4,9 +4,6 @@ Windows: faster-whisper + edge-tts
 LoongArch: whisper.cpp + 本地TTS
 """
 import asyncio
-import io
-import wave
-import threading
 from typing import Optional, Callable
 from pathlib import Path
 
@@ -14,7 +11,7 @@ import numpy as np
 
 from loguru import logger
 from src.utils.event_bus import EventBus, Event
-from configs.settings import ASRConfig
+from configs.settings import ASRConfig, config as system_config
 
 
 class SpeechEngine:
@@ -27,6 +24,7 @@ class SpeechEngine:
         self.asr_model = None
         self.wake_model = None
         self.vad = None
+        self._edge_warned = False
 
     async def initialize(self):
         """初始化 ASR/TTS/VAD 模型"""
@@ -42,23 +40,34 @@ class SpeechEngine:
             self.vad = EnergyVAD()
 
         # ----- ASR (语音识别) -----
+        # 注意: 模型未缓存时 WhisperModel 会尝试联网下载，受限网络下会失败/卡死，
+        # 因此用 local_files_only + 宽异常捕获，失败则降级为文本输入而不是让启动崩溃。
+        # 优先查 D 盘手动下载路径（企业网 SSL 拦截，模型已手工下载到 D 盘）
         try:
             from faster_whisper import WhisperModel
+            _d_path = "D:/huggingface_cache/models--Systran--faster-whisper-tiny/snapshots/tiny"
+            from pathlib import Path as _Path
+            model_arg = _d_path if _Path(_d_path).is_dir() else self.config.model
             self.asr_model = WhisperModel(
-                self.config.model,
+                model_arg,
                 device=self.config.device,
                 compute_type=self.config.compute_type,
+                local_files_only=True,
             )
             logger.info(f"  ASR 模型加载成功: faster-whisper ({self.config.model})")
         except ImportError:
-            logger.warning("  faster-whisper 未安装，使用 openai-whisper")
+            logger.warning("  faster-whisper 未安装，尝试 openai-whisper")
             try:
                 import whisper
                 self.asr_model = whisper.load_model(self.config.model)
                 logger.info(f"  ASR 模型加载成功: whisper ({self.config.model})")
-            except ImportError:
-                logger.error("  无可用 ASR 引擎！请安装 faster-whisper 或 openai-whisper")
-                raise
+            except Exception as e:
+                logger.warning(f"  openai-whisper 不可用 ({e})，ASR 降级为文本输入")
+                self.asr_model = None
+        except Exception as e:
+            logger.warning(f"  ASR 模型未就绪 ({e})")
+            logger.info(f"  请先下载 whisper {self.config.model} 模型；当前降级为文本输入")
+            self.asr_model = None
 
         # ----- 唤醒词检测 -----
         logger.info(f"唤醒词: '{self.config.wake_word}'")
@@ -80,6 +89,11 @@ class SpeechEngine:
         3. 语音片段送入 ASR 识别
         4. 识别结果发布到事件总线
         """
+        if self.asr_model is None:
+            logger.info("ASR 模型不可用，进入文本输入模式")
+            await self._text_fallback_loop()
+            return
+
         try:
             import pyaudio
             self.audio = pyaudio.PyAudio()
@@ -88,7 +102,7 @@ class SpeechEngine:
                 channels=1,
                 rate=self.config.sample_rate,
                 input=True,
-                frames_per_buffer=512,
+                frames_per_buffer=480,  # 30ms@16kHz — webrtcvad 仅接受 10/20/30ms 帧长
             )
             logger.info("🎤 麦克风已就绪，开始监听...")
         except Exception as e:
@@ -107,7 +121,7 @@ class SpeechEngine:
         while self.is_listening:
             try:
                 # 读取音频帧
-                data = self.audio_stream.read(512, exception_on_overflow=False)
+                data = self.audio_stream.read(480, exception_on_overflow=False)
                 is_speech = self.vad.is_speech(data, self.config.sample_rate)
 
                 if is_speech:
@@ -136,6 +150,8 @@ class SpeechEngine:
 
     async def _transcribe(self, audio_data: bytes) -> Optional[str]:
         """将音频数据转录为文本"""
+        if self.asr_model is None:
+            return None
         try:
             # 将原始 PCM 转为 numpy 数组
             audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
@@ -165,73 +181,40 @@ class SpeechEngine:
 
     async def speak(self, text: str, interrupt: bool = False):
         """
-        TTS 语音合成并播放
+        TTS 语音合成并播放（线程池执行，不阻塞事件循环）
 
-        Windows: edge-tts (调用系统Edge TTS)
-        LoongArch: pyttsx3 / espeak (离线TTS)
+        引擎由 configs.settings 的 tts_engine 决定:
+        - pyttsx3: 离线合成+播放（Windows SAPI，LoongArch 上可换 espeak），CLI 默认
+        - edge:    edge-tts 输出为 MP3，CLI 无本地解码器暂无法播放 → 自动回退 pyttsx3
+                   （Web Demo 的 edge-tts 语音由浏览器播放，见 app_demo.py）
+        注: interrupt 打断当前播报尚未实现（TODO）
         """
         if not text:
             return
 
         logger.info(f"🔊 TTS: {text}")
 
-        try:
-            import edge_tts
-            communicate = edge_tts.Communicate(text, self.config.tts_voice)
-            # 收集音频数据
-            audio_data = io.BytesIO()
-            async for chunk in communicate.stream():
-                if chunk["type"] == "audio":
-                    audio_data.write(chunk["data"])
-            audio_data.seek(0)
+        if system_config.tts_engine == "edge" and not self._edge_warned:
+            self._edge_warned = True
+            logger.warning("edge-tts 输出 MP3，CLI 下无解码器无法播放，已改用 pyttsx3 离线播报")
 
-            # 异步播放（不阻塞）
-            threading.Thread(
-                target=self._play_audio,
-                args=(audio_data,),
-                daemon=True
-            ).start()
-
-        except ImportError:
-            logger.warning("edge-tts 不可用，尝试 pyttsx3...")
+        def _run():
             try:
                 import pyttsx3
                 engine = pyttsx3.init()
                 engine.say(text)
                 engine.runAndWait()
-            except Exception:
-                logger.warning("TTS 不可用，仅文本输出")
-                # 降级输出
+                engine.stop()
+            except Exception as e:
+                logger.warning(f"TTS 播报失败({e})，降级为文本输出")
                 print(f"\n🤖 [小航]: {text}\n")
 
-    def _play_audio(self, audio_data: io.BytesIO):
-        """播放音频数据"""
-        try:
-            import pyaudio
-            import wave
-
-            wf = wave.open(audio_data, 'rb')
-            p = pyaudio.PyAudio()
-            stream = p.open(
-                format=p.get_format_from_width(wf.getsampwidth()),
-                channels=wf.getnchannels(),
-                rate=wf.getframerate(),
-                output=True,
-            )
-            chunk = 1024
-            data = wf.readframes(chunk)
-            while data:
-                stream.write(data)
-                data = wf.readframes(chunk)
-            stream.stop_stream()
-            stream.close()
-            p.terminate()
-        except Exception as e:
-            logger.error(f"音频播放失败: {e}")
+        await asyncio.get_event_loop().run_in_executor(None, _run)
 
     async def _text_fallback_loop(self):
         """降级模式 — 文本输入代替语音"""
         logger.info("📝 文本输入模式（输入 'q' 退出）")
+        self.is_listening = True   # 修复: 此前未置 True，下面的循环体一次都不会执行
         while self.is_listening:
             try:
                 # 在线程池中运行阻塞的 input

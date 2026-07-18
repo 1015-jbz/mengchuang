@@ -90,6 +90,10 @@ _latest_emotion = "neutral"
 _latest_confidence = 0.0
 _lock = threading.Lock()
 
+# TTS 异步队列：后台合成为避免阻塞 UI，完成后由定时器推送到前端
+_pending_audio = None
+_audio_lock = threading.Lock()
+
 # ============================================================
 # Flask MJPEG 视频流服务
 # ============================================================
@@ -113,6 +117,36 @@ EMOTION_ZH = {
     "happy": "开心", "sad": "悲伤", "angry": "愤怒",
     "surprised": "惊讶", "fearful": "恐惧", "neutral": "平静",
     "disgusted": "厌恶",
+}
+
+# ============================================================
+# 语音角色选择 — edge-tts 中文语音库（均为微软神经 TTS）
+# ============================================================
+VOICE_OPTIONS = {
+    # ── 动漫风 ──
+    "xiaoyi":    "🎭 晓伊 · 活泼动漫少女 (Cartoon, Lively)",
+    "yunxia":    "🎭 云夏 · 可爱动漫正太 (Cartoon, Cute)",
+    # ── 温柔/日常 ──
+    "xiaoxiao":  "🌸 晓晓 · 温柔姐姐 (Warm, 默认)",
+    "yunxi":     "☀️ 云希 · 阳光少年 (Lively, Sunshine)",
+    "yunjian":   "🔥 云健 · 热血青年 (Passion)",
+    # ── 专业播报 ──
+    "yunyang":   "📰 云扬 · 专业主播 (Professional)",
+    # ── 方言趣味 ──
+    "xiaobei":   "🤣 晓北 · 东北大碴子 (Dialect, Humorous)",
+    "xiaoni":    "😄 晓妮 · 陕西嫽咋咧 (Dialect, Bright)",
+}
+VOICE_IDS = {k: f"zh-CN-{k.capitalize()}Neural" for k in VOICE_OPTIONS}
+DEFAULT_VOICE = "xiaoyi"  # 默认改成动漫少女，更有趣
+
+# 声线预设 — 一键切换风格
+VOICE_STYLE_PRESETS = {
+    "默认":      ("+0Hz",  "+0%"),
+    "二次元萌音": ("+30Hz", "+15%"),   # 高音 + 稍快 ≈ 动漫少女
+    "懒羊羊 🐑":  ("-20Hz", "-40%"),   # 低音 + 大幅放慢 ≈ 懒羊羊拖长音
+    "热血少年":   ("+10Hz", "+25%"),   # 略高 + 快
+    "沉稳大叔":   ("-25Hz", "-15%"),   # 低音 + 稍慢
+    "可爱正太":   ("+40Hz", "+10%"),   # 很高 + 稍快
 }
 
 # 基线校准系统 — LBP 纹理特征基线
@@ -446,10 +480,15 @@ asr_model = None
 try:
     from faster_whisper import WhisperModel
     import os as _os
-    cache = _os.path.expanduser("~/.cache/huggingface/hub/models--Systran--faster-whisper-tiny")
-    if _os.path.isdir(cache):
+    # 优先查 D 盘自定义路径（企业网 SSL 拦截导致正常下载失败，模型手动下载到 D 盘）
+    _whisper_path = "D:/huggingface_cache/models--Systran--faster-whisper-tiny/snapshots/tiny"
+    _cache_path = _os.path.expanduser("~/.cache/huggingface/hub/models--Systran--faster-whisper-tiny")
+    if _os.path.isdir(_whisper_path):
+        asr_model = WhisperModel(_whisper_path, device="cpu", compute_type="int8", local_files_only=True)
+        logger.info("faster-whisper 就绪 (D盘)")
+    elif _os.path.isdir(_cache_path):
         asr_model = WhisperModel("tiny", device="cpu", compute_type="int8", local_files_only=True)
-        logger.info("faster-whisper 就绪")
+        logger.info("faster-whisper 就绪 (C盘缓存)")
     else:
         logger.info("Whisper 模型未缓存，语音识别使用文本降级")
 except Exception:
@@ -535,29 +574,77 @@ def generate_reply(text, emotion="neutral"):
         "明白。需要我帮你操作什么吗？",
     ])
 
-def tts(text):
-    """TTS 文字转语音（后台线程，不阻塞 UI）"""
+# ═══════════════════════════════════════════════════════════
+# TTS 语音合成 — edge-tts 优先（8 种中文语音可选）→ pyttsx3 兜底
+# ═══════════════════════════════════════════════════════════
+
+def tts_speak(text, voice_key=None, pitch="+0Hz", rate="+0%"):
+    """合成语音文件并返回路径。edge-tts 2s 超时，超时/失败则 pyttsx3 兜底"""
     if not text:
         return None
     import tempfile
-    out_path = Path(tempfile.gettempdir()) / "cockpit_tts.mp3"
+    stamp = int(time.time() * 1000)
+    voice_id = VOICE_IDS.get(voice_key or DEFAULT_VOICE, VOICE_IDS[DEFAULT_VOICE])
+    use_ssml = (pitch != "+0Hz" or rate != "+0%")
+    tts_text = _build_ssml(text, voice_id, pitch, rate) if use_ssml else text
 
-    def _run():
+    # ── 优先: edge-tts（8 种中文语音，含动漫/方言/男声/女声）──
+    out_mp3 = Path(tempfile.gettempdir()) / f"cockpit_tts_{stamp}.mp3"
+    mp3_ready = [False]
+
+    def _edge():
         try:
             import edge_tts, asyncio
-            async def gen():
-                comm = edge_tts.Communicate(text, "zh-CN-XiaoxiaoNeural")
-                await comm.save(str(out_path))
+            async def _gen():
+                comm = edge_tts.Communicate(tts_text, voice_id)
+                await comm.save(str(out_mp3))
             loop = asyncio.new_event_loop()
-            loop.run_until_complete(gen())
-            loop.close()
-        except Exception as e:
-            logger.warning(f"TTS 失败: {e}")
+            try:
+                loop.run_until_complete(_gen())
+            finally:
+                loop.close()
+            if out_mp3.exists() and out_mp3.stat().st_size > 0:
+                mp3_ready[0] = True
+        except Exception:
+            pass
 
-    t = threading.Thread(target=_run, daemon=True)
+    t = threading.Thread(target=_edge, daemon=True)
     t.start()
-    t.join(timeout=3.0)  # 等最多3秒
-    return str(out_path) if out_path.exists() else None
+    t.join(timeout=2.0)
+
+    if mp3_ready[0]:
+        return str(out_mp3)
+
+    # ── 兜底: pyttsx3 离线（稳定但语音角色少，全部声音相同）──
+    try:
+        out_wav = Path(tempfile.gettempdir()) / f"cockpit_tts_{stamp}.wav"
+        import pyttsx3
+        engine = pyttsx3.init()
+        engine.save_to_file(text, str(out_wav))
+        engine.runAndWait()
+        engine.stop()
+        if out_wav.exists() and out_wav.stat().st_size > 0:
+            return str(out_wav)
+    except Exception:
+        pass
+
+    return None
+
+
+def _build_ssml(text, voice_id, pitch="+0Hz", rate="+0%"):
+    """构建带声线调节的 SSML"""
+    return (
+        f'<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" '
+        f'xmlns:mstts="http://www.w3.org/2001/mstts" xml:lang="zh-CN">'
+        f'<voice name="{voice_id}">'
+        f'<prosody pitch="{pitch}" rate="{rate}">'
+        f'{text}'
+        f'</prosody>'
+        f'</voice>'
+        f'</speak>'
+    )
+
+
 
 # ============================================================
 # Gradio UI 回调
@@ -578,12 +665,12 @@ def get_emotion_status():
         "人脸检测": "已检测" if conf > 0 else "未检测或等待中",
     }
 
-def process_text(text, chat_hist):
-    """处理文本输入"""
+def process_text(text, chat_hist, voice_key, pitch_val, rate_val):
+    """处理文本输入 — pitch_val/rate_val 直接来自滑块，支持 DIY 任意调节"""
     if chat_hist is None:
         chat_hist = []
     if not text or not text.strip():
-        return chat_hist, "请输入内容"
+        return chat_hist, "请输入内容", None
 
     text = text.strip()
 
@@ -595,9 +682,7 @@ def process_text(text, chat_hist):
     except Exception as e:
         reply = f"抱歉，出错了: {e}"
 
-    # TTS 后台执行
-    import threading as _th
-    _th.Thread(target=lambda: tts(reply), daemon=True).start()
+    audio_path = tts_speak(reply, voice_key, f"{pitch_val:+d}Hz", f"{rate_val:+d}%")
 
     # Gradio 6.0 使用新格式
     chat_hist.append({"role": "user", "content": text})
@@ -611,16 +696,17 @@ def process_text(text, chat_hist):
             break
 
     status = f"意图: {intent} | 情绪: {EMOTION_ZH.get(emo, '?')}"
-    return chat_hist, status
+    return chat_hist, status, audio_path
 
-def process_audio(audio_path, chat_hist):
+def process_audio(audio_path, chat_hist, voice_key, pitch_val, rate_val):
     """处理语音输入"""
-    if audio_path is None or chat_hist is None:
-        return (chat_hist or [], "") if chat_hist is None else (chat_hist, "")
+    chat_hist = chat_hist or []
+    if audio_path is None:
+        return chat_hist, "", None
     text = transcribe(audio_path)
     if not text:
-        return chat_hist, "(未识别到语音)"
-    return process_text(text, chat_hist)
+        return chat_hist, "(未识别到语音)", None
+    return process_text(text, chat_hist, voice_key, pitch_val, rate_val)
 
 # ============================================================
 # 启动
@@ -660,8 +746,6 @@ if __name__ == "__main__":
         logger.warning("Flask 未安装，无视频流")
 
     # Gradio UI
-    video_url = "http://localhost:7861/video_feed" if HAS_FLASK else ""
-
     with gr.Blocks(title="Smart Cockpit") as demo:
         gr.Markdown("# 智能座舱多模态交互终端")
         gr.Markdown("### 基于 LoongArch 端侧 AI | 实时表情识别 | 智能语音对话")
@@ -670,12 +754,13 @@ if __name__ == "__main__":
             with gr.Column(scale=1):
                 gr.Markdown("### 实时表情识别")
 
-                if video_url:
-                    # 直接嵌入 MJPEG 流
-                    gr.HTML(f"""
+                if HAS_FLASK:
+                    # 直接嵌入 MJPEG 流。src 用页面自身的 hostname 拼接，
+                    # 避免硬编码 localhost 导致手机/投屏等外部设备访问时视频黑屏
+                    gr.HTML("""
                     <div style="border:2px solid #00d4aa; border-radius:10px; overflow:hidden; background:#000;">
-                        <img src="{video_url}" style="width:100%; display:block;"
-                             onerror="this.onerror=null; this.src=''; this.parentElement.innerHTML='<p style=color:red;padding:20px;>摄像头未就绪，请确认摄像头已连接</p>'">
+                        <img src="invalid://bootstrap" style="width:100%; display:block;"
+                             onerror="if(!this.dataset.boot){this.dataset.boot=1;this.src=location.protocol+'//'+location.hostname+':7861/video_feed';}else{this.onerror=null;this.parentElement.innerHTML='<p style=color:red;padding:20px;>摄像头未就绪，请确认摄像头已连接</p>';}">
                     </div>
                     <p style="text-align:center;color:#888;font-size:12px;">MJPEG 实时流 · 25 FPS</p>
                     """)
@@ -685,9 +770,8 @@ if __name__ == "__main__":
                 emotion_display = gr.Markdown("# 😐 等待中...")
                 emotion_bar = gr.Slider(0, 1, value=0, label="情绪置信度", interactive=False)
                 status_box = gr.JSON(
-                    value={"表情":"等待", "置信度":"0%", "人脸":"等待"},
+                    value={"表情": "等待", "置信度": "0%", "人脸检测": "等待"},
                     label="检测状态",
-                    every=0.5,  # 每0.5秒轮询
                 )
 
             with gr.Column(scale=2):
@@ -695,14 +779,43 @@ if __name__ == "__main__":
                 chatbot = gr.Chatbot(label="对话记录", height=400)
 
                 with gr.Row():
-                    mic = gr.Audio(sources=["microphone"], type="filepath", label="语音输入")
+                    mic = gr.Audio(sources=["microphone"], type="filepath", label="🎤 语音输入")
                     txt = gr.Textbox(placeholder="或在这里打字...", label="文字输入", scale=2)
+
+                with gr.Row():
+                    voice_selector = gr.Dropdown(
+                        choices=[(label, key) for key, label in VOICE_OPTIONS.items()],
+                        value=DEFAULT_VOICE,
+                        label="🎙️ 语音角色",
+                        interactive=True,
+                        scale=1,
+                    )
+                    voice_style = gr.Dropdown(
+                        choices=list(VOICE_STYLE_PRESETS.keys()),
+                        value="默认",
+                        label="🎚️ 风格预设",
+                        interactive=True,
+                        scale=1,
+                    )
+
+                with gr.Row():
+                    pitch_slider = gr.Slider(
+                        -50, 50, value=0, step=5,
+                        label="🎵 音高偏移 (Hz) — 负数=低沉懒羊羊，正数=尖细萌音",
+                        interactive=True,
+                    )
+                    rate_slider = gr.Slider(
+                        -50, 50, value=0, step=5,
+                        label="⏩ 语速偏移 (%) — 负数=拖长音，正数=快语速",
+                        interactive=True,
+                    )
 
                 with gr.Row():
                     send = gr.Button("发送", variant="primary")
                     clear = gr.Button("清空")
 
                 status_line = gr.Textbox(label="状态", value="就绪", interactive=False)
+                voice_out = gr.Audio(label="小航语音回复", autoplay=True, interactive=False)
 
         gr.Markdown("""
         ---
@@ -714,21 +827,29 @@ if __name__ == "__main__":
         *LoongArch 端侧AI · 100%本地推理 · 隐私安全保障*
         """)
 
-        # 事件绑定 (Gradio 6.0)
-        send.click(fn=process_text, inputs=[txt, chatbot],
-                   outputs=[chatbot, status_line]).then(
+        # 事件绑定 (Gradio 6.0) — 语音选择+音高+语速全部由滑块直驱
+        send.click(fn=process_text, inputs=[txt, chatbot, voice_selector, pitch_slider, rate_slider],
+                   outputs=[chatbot, status_line, voice_out]).then(
                    lambda: "", outputs=[txt])
-        txt.submit(fn=process_text, inputs=[txt, chatbot],
-                   outputs=[chatbot, status_line]).then(
+        txt.submit(fn=process_text, inputs=[txt, chatbot, voice_selector, pitch_slider, rate_slider],
+                   outputs=[chatbot, status_line, voice_out]).then(
                    lambda: "", outputs=[txt])
-        mic.stop_recording(fn=process_audio, inputs=[mic, chatbot],
-                           outputs=[chatbot, status_line])
-        clear.click(fn=lambda: ([], "已清空"),
-                    outputs=[chatbot, status_line])
+        mic.stop_recording(fn=process_audio, inputs=[mic, chatbot, voice_selector, pitch_slider, rate_slider],
+                           outputs=[chatbot, status_line, voice_out])
+
+        # 风格预设 → 一键设滑块
+        def _apply_preset(preset_name):
+            p, r = VOICE_STYLE_PRESETS.get(preset_name, ("+0Hz", "+0%"))
+            return int(p.replace("Hz", "").replace("+", "")), int(r.replace("%", "").replace("+", ""))
+        voice_style.change(fn=_apply_preset, inputs=[voice_style],
+                           outputs=[pitch_slider, rate_slider])
+        clear.click(fn=lambda: ([], "已清空", None),
+                    outputs=[chatbot, status_line, voice_out])
 
         # 表情状态轮询
-        status_box.change(fn=lambda x: (f"# {EMOTION_ZH.get(x.get('表情',''), '等待')} {get_emotion_status()[0].split()[-1] if get_emotion_status()[0] else ''}", get_emotion_status()[1]),
-                          inputs=[status_box], outputs=[emotion_display, emotion_bar])
+        emo_timer = gr.Timer(0.5)
+        emo_timer.tick(fn=get_emotion_status,
+                       outputs=[emotion_display, emotion_bar, status_box])
 
     demo.launch(server_name="0.0.0.0", server_port=7860, share=False,
                 theme=gr.themes.Soft(), show_error=True)

@@ -33,6 +33,7 @@ class LLMEngine:
         self.llm = None          # llama-cpp-python Llama 实例
         self.embedding_model = None
         self.knowledge_base: List[Dict] = []
+        self._kb_embeddings = None
         self._stop_generation = False
 
     async def initialize(self):
@@ -307,7 +308,8 @@ class LLMEngine:
 
     def _retrieve_knowledge(self, query: str, top_k: int = 3) -> str:
         """检索相关知识"""
-        if not self.embedding_model or not self._kb_embeddings:
+        # 注意: _kb_embeddings 是 numpy 数组，不能用 `not` 判断（数组真值歧义会抛 ValueError）
+        if self.embedding_model is None or self._kb_embeddings is None:
             return ""
 
         try:

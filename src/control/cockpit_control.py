@@ -4,7 +4,7 @@
 import random
 from typing import Dict, Any, Optional
 from loguru import logger
-from src.utils.event_bus import EventBus
+from src.utils.event_bus import EventBus, Event
 
 
 class CockpitController:
@@ -69,10 +69,11 @@ class CockpitController:
         else:
             response = f"好的，已执行{intent}操作"
 
-        # 发布状态变更
-        await self.event_bus.publish(EventBus.Event(
-            type="cockpit.state_changed",
-            data={"intent": intent, "slots": slots, "response": response}
+        # 发布状态变更（事件名须与 orchestrator 的订阅一致；Event 是模块级类，不是 EventBus 属性）
+        await self.event_bus.publish(Event(
+            type="vehicle.state_changed",
+            data={"intent": intent, "slots": slots, "response": response},
+            source="cockpit_control",
         ))
 
         return response
@@ -130,16 +131,17 @@ class CockpitController:
                 return msg
         return "车辆各系统状态正常"
 
-    def execute_entertainment(self, intent: str, slots: dict) -> str:
-        """娱乐系统控制"""
+    async def execute_entertainment(self, intent: str, slots: dict) -> str:
+        """娱乐系统控制（async 与 execute 保持一致，orchestrator 中以 await 调用）"""
         if "音量" in intent:
             vol = slots.get("volume", 30)
             self.device_states["audio"]["volume"] = vol
             return f"音量已调至{vol}"
-        if "播放" in intent:
+        if "播放" in intent or "点播" in intent:
             song = slots.get("song_name", "")
             if song:
                 return f"正在为您播放：{song}"
+            return "好的，为您播放音乐"
         if "暂停" in intent:
             return "已暂停播放"
         if "下一首" in intent:

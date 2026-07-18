@@ -1,55 +1,50 @@
 # ============================================================
 # 智能座舱多模态交互终端 — Python 依赖
 # 适配 Windows 开发环境，后续迁移至 LoongArch
+#
+# 2026-07-18 修正:
+#   - "pytorch" 不是 PyPI 包名（正确是 torch），原清单 pip install 必失败
+#   - 移除非法行 "asyncio (内置)"（pip 无法解析）
+#   - 补上 app_demo.py 实际依赖的 flask、CLI 离线 TTS 的 pyttsx3
+#   - 注释掉代码中零引用的依赖（dlib/face-recognition/librosa 等），
+#     避免虚增 LoongArch 移植工作量评估
 # ============================================================
 
-# ----- 音频处理 -----
-pyaudio==0.2.14
-webrtcvad==2.0.10
-soundfile>=0.12.0
-librosa>=0.10.0
+# ----- 基础数值 -----
 numpy>=1.24.0
-scipy>=1.11.0
+scipy>=1.11.0             # RAG 余弦相似度
+
+# ----- 音频（CLI 语音模式可选；纯文本模式可不装） -----
+pyaudio==0.2.14           # 麦克风采集
+webrtcvad==2.0.10         # 语音活动检测（未装时自动降级为能量 VAD）
 
 # ----- 语音识别 (ASR) -----
-# Whisper 端侧ASR (faster-whisper 比 openai-whisper 更快)
 faster-whisper>=1.0.0
-openai-whisper>=20231117
+# openai-whisper>=20231117  # 备选引擎，faster-whisper 可用时无需安装
 
 # ----- 语音合成 (TTS) -----
-edge-tts>=6.1.0          # Windows 免费 TTS
-# pyttsx3>=2.90            # 离线 TTS 备选
+edge-tts>=6.1.0           # 微软云端 TTS（需联网；Web Demo 用，浏览器播放）
+pyttsx3>=2.90             # 离线 TTS（Windows SAPI；CLI 默认引擎，LoongArch 换 espeak）
 
-# ----- NLP / NLU -----
-transformers>=4.40.0
-sentence-transformers>=2.7.0
-jieba>=0.42.0
-pytorch>=2.0.0
-onnxruntime>=1.17.0       # 跨平台推理（LoongArch 需源码编译）
+# ----- NLP / NLU（可选，默认关闭，见 configs/settings.py use_ml_classifier） -----
+# transformers>=4.40.0    # BERT 意图分类头未微调前不启用
+# torch>=2.0.0            # 注意: 包名是 torch，不是 pytorch！
+# sentence-transformers>=2.7.0  # RAG 向量检索（可选）
 
 # ----- LLM 推理 -----
-# llama-cpp-python>=0.2.0  # llama.cpp Python 绑定 (LoongArch 需编译)
-# 注意: llama-cpp-python 在 Windows 上可直接 pip install，
-# LoongArch 上需从源码编译并指定 LoongArch 架构
+# llama-cpp-python>=0.2.0  # llama.cpp Python 绑定 (Windows 可 pip 装，LoongArch 需源码编译)
 
 # ----- 计算机视觉 -----
 opencv-python>=4.9.0
-mediapipe>=0.10.8         # 面部关键点 / 姿态估计
-dlib>=19.24.0             # 面部特征点 (Windows 可用，LoongArch 需源码编译)
-face-recognition>=1.3.0
-
-# ----- 异步与通信 -----
-pyzmq>=25.1.0             # 事件总线
-asyncio (内置)
-websockets>=12.0
+onnxruntime>=1.17.0       # 表情识别推理（LoongArch 需源码编译）
+mediapipe>=0.10.8         # 安全监控面部关键点（不可用时自动降级为模拟模式）
+# dlib / face-recognition / librosa / soundfile: 代码中未引用，已移除
+# （dlib 在 LoongArch 上极难编译，切勿因旧清单误装）
 
 # ----- Web UI (Demo) -----
-gradio>=4.20.0            # 快速构建演示界面
-# streamlit>=1.30.0
+gradio>=6.0               # 注意 6.x API 与 5.x 不兼容（见交接文档第五节）
+flask>=3.0                # MJPEG 视频流（app_demo.py 必需）
 
 # ----- 工具 -----
 pydantic>=2.6.0
 loguru>=0.7.0
-python-dotenv>=1.0.0
-rich>=13.0.0              # 终端美化输出
-psutil>=5.9.0

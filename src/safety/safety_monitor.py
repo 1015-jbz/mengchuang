@@ -56,6 +56,7 @@ class SafetyMonitor:
         self.state = SafetyState()
         self._eye_closure_history = deque(maxlen=300)  # 最近5秒(60fps*5)
         self._yawn_timestamps = deque(maxlen=100)      # 哈欠时间戳
+        self._was_yawning = False                      # 哈欠上升沿检测
         self._gaze_history = deque(maxlen=100)
         self._distraction_start: Optional[float] = None
         self._fatigue_score = 0.0
@@ -185,12 +186,14 @@ class SafetyMonitor:
         # 2. 打哈欠检测 — 嘴部纵横比 (MAR)
         mouth_ratio = self._mouth_aspect_ratio(points)
         is_yawning = mouth_ratio > 0.6  # 阈值
-        if is_yawning:
-            now = time.time()
+        now = time.time()
+        # 只在“开始张嘴”的上升沿计一次哈欠，避免张嘴期间每帧都 +1
+        if is_yawning and not self._was_yawning:
             self._yawn_timestamps.append(now)
-            # 清理旧记录 (保留60秒内)
-            while self._yawn_timestamps and self._yawn_timestamps[0] < now - 60:
-                self._yawn_timestamps.popleft()
+        self._was_yawning = is_yawning
+        # 清理旧记录 (保留60秒内)
+        while self._yawn_timestamps and self._yawn_timestamps[0] < now - 60:
+            self._yawn_timestamps.popleft()
         self.state.yawn_count = len(self._yawn_timestamps)
 
         # 3. 头部姿态估计
@@ -230,22 +233,36 @@ class SafetyMonitor:
 
     @staticmethod
     def _eye_aspect_ratio(eye_points) -> float:
-        """计算眼部纵横比 (Eye Aspect Ratio)"""
-        # 垂直距离
-        v1 = np.linalg.norm(np.array(eye_points[1]) - np.array(eye_points[3]))
-        v2 = np.linalg.norm(np.array(eye_points[0]) - np.array(eye_points[2]))
-        # 水平距离
-        h = np.linalg.norm(np.array(eye_points[0]) - np.array(eye_points[2]))
+        """
+        计算眼部纵横比 (Eye Aspect Ratio)
+
+        eye_points 顺序对应 LEFT_EYE/RIGHT_EYE 索引: [内眼角, 外眼角, 上睑, 下睑]
+        EAR = 上下眼睑距离 / 内外眼角距离，睁眼约 0.25-0.35，闭眼 < 0.1
+        （旧实现的"垂直"与"水平"取的是同一段线段，EAR 恒 ≥ 0.5，闭眼永远检测不到）
+        """
+        v = np.linalg.norm(np.array(eye_points[2]) - np.array(eye_points[3]))
+        h = np.linalg.norm(np.array(eye_points[0]) - np.array(eye_points[1]))
         if h < 1e-6:
-            return 0
-        return (v1 + v2) / (2.0 * h)
+            return 0.0
+        return float(v / h)
 
     @staticmethod
     def _mouth_aspect_ratio(points) -> float:
-        """计算嘴部纵横比 (Mouth Aspect Ratio)"""
-        top = points[13]
-        bottom = points[14]
-        return abs(top[1] - bottom[1]) / max(1, abs(top[0] - bottom[0]))
+        """
+        计算嘴部纵横比 (Mouth Aspect Ratio)
+
+        MAR = 上下内唇距离(13-14) / 嘴角宽度(61-291)
+        （旧实现除以的是 13/14 两点的水平差——这两点几乎垂直对齐，分母被钳到 1 像素，
+        导致闭嘴时 MAR 也远超阈值，哈欠检测常开）
+        """
+        top = np.array(points[13])
+        bottom = np.array(points[14])
+        left = np.array(points[61])
+        right = np.array(points[291])
+        width = np.linalg.norm(left - right)
+        if width < 1e-6:
+            return 0.0
+        return float(np.linalg.norm(top - bottom) / width)
 
     async def _assess_risk(self):
         """

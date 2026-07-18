@@ -29,6 +29,7 @@ class NLUConfig(BaseModel):
     """意图理解配置"""
     intent_model: str = "bert-base-chinese"
     device: str = "cpu"
+    use_ml_classifier: bool = False     # bert 分类头未经意图数据微调，输出为噪声；微调后再开启
     confidence_threshold: float = 0.65  # 意图置信度阈值
     max_context_turns: int = 10          # 多轮对话窗口
     slot_filling_model: str = "bert-base-chinese"
@@ -83,7 +84,7 @@ class SystemConfig(BaseModel):
     log_level: str = "INFO"
     event_bus_address: str = "ipc:///tmp/smart_cockpit_bus"
     # TTS
-    tts_engine: str = "edge"             # edge / pyttsx3 / offline
+    tts_engine: str = "pyttsx3"          # pyttsx3(离线,CLI默认) / edge(需联网,MP3输出,CLI暂无法播放)
     tts_voice: str = "zh-CN-XiaoxiaoNeural"
 
 

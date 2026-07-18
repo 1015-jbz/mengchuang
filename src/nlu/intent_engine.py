@@ -58,18 +58,24 @@ class IntentEngine:
         self._init_rule_patterns()
 
         # 尝试加载 ML 模型
-        try:
-            from transformers import AutoTokenizer, AutoModelForSequenceClassification
-            model_name = self.config.intent_model
-            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-            self.model = AutoModelForSequenceClassification.from_pretrained(
-                model_name, num_labels=len(self.DOMAIN_LABELS)
-            )
-            logger.info(f"  意图分类模型加载成功: {model_name}")
-            self._use_ml = True
-        except Exception as e:
-            logger.warning(f"  ML模型加载失败 ({e})，使用规则引擎降级方案")
-            self._use_ml = False
+        # 默认关闭 (settings.NLUConfig.use_ml_classifier=False):
+        # bert-base-chinese 的分类头是随机初始化、未经意图数据微调的，
+        # 输出接近随机噪声，其“置信度”反而会覆盖规则匹配的正确结果。微调后再开启。
+        self._use_ml = False
+        if self.config.use_ml_classifier:
+            try:
+                from transformers import AutoTokenizer, AutoModelForSequenceClassification
+                model_name = self.config.intent_model
+                self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+                self.model = AutoModelForSequenceClassification.from_pretrained(
+                    model_name, num_labels=len(self.DOMAIN_LABELS)
+                )
+                logger.info(f"  意图分类模型加载成功: {model_name}")
+                self._use_ml = True
+            except Exception as e:
+                logger.warning(f"  ML模型加载失败 ({e})，使用规则引擎降级方案")
+        else:
+            logger.info("  ML 意图分类未启用（分类头未微调），使用规则引擎")
 
         logger.info("意图理解引擎初始化完成")
 
@@ -243,7 +249,7 @@ class IntentEngine:
 
         # 领域特定槽位
         if domain == "车辆控制" and intent == "空调控制":
-            if "温度" not in slots:
+            if "temperature" not in slots:
                 temp_match = re.search(r"(\d+)\s*度", text)
                 if temp_match:
                     slots["temperature"] = int(temp_match.group(1))
