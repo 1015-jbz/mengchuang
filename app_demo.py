@@ -1195,5 +1195,5 @@ if __name__ == "__main__":
         audio_timer = gr.Timer(0.3)
         audio_timer.tick(fn=get_pending_audio, outputs=[voice_out])
 
-    demo.launch(server_name="0.0.0.0", server_port=7860, share=False,
+    demo.launch(server_name="0.0.0.0", server_port=7860, share=True,
                 theme=gr.themes.Soft(), show_error=True)
