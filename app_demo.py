@@ -1195,5 +1195,18 @@ if __name__ == "__main__":
         audio_timer = gr.Timer(0.3)
         audio_timer.tick(fn=get_pending_audio, outputs=[voice_out])
 
-    demo.launch(server_name="0.0.0.0", server_port=7860, share=True,
+    # 启动 ngrok 公网隧道（替代 Gradio share，URL 清晰可见）
+    public_url = None
+    try:
+        from pyngrok import ngrok
+        tunnel = ngrok.connect(7860, "http")
+        public_url = tunnel.public_url
+        print(f"\n{'='*60}")
+        print(f"  >>> 公网访问链接: {public_url} <<<")
+        print(f"  >>> 发给任何人，不管在不在同一 WiFi 都能打开 <<<")
+        print(f"{'='*60}\n")
+    except Exception as e:
+        print(f"[!] ngrok 隧道启动失败: {e}")
+
+    demo.launch(server_name="0.0.0.0", server_port=7860, share=False,
                 theme=gr.themes.Soft(), show_error=True)
