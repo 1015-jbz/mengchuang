@@ -203,13 +203,59 @@ def _extract_face_features(face_img_rgb):
 _last_onnx_result = ("neutral", 0.5)
 _onnx_frame_counter = 0
 
+def _sadness_boost(onnx_emotion, onnx_conf, face_img_rgb):
+    """ONNX 后处理：AffectNet 数据集中悲伤样本偏少，模型对悲伤不够敏感。
+    当 ONNX 预测为 neutral 但面部特征强烈指向悲伤时，提升为 sad。"""
+    if onnx_emotion != "neutral":
+        return onnx_emotion, onnx_conf
+
+    # 提取面部特征做悲伤启发式判断
+    gray = cv2.cvtColor(face_img_rgb, cv2.COLOR_RGB2GRAY)
+    h, w = gray.shape
+    fmean = float(gray.mean())
+    fstd = float(gray.std())
+
+    # 嘴角区域：检测左右不对称 + 嘴角下垂特征
+    mouth = gray[2*h//3:, w//6:5*w//6]
+    left_mouth = gray[2*h//3:, :w//3]
+    right_mouth = gray[2*h//3:, 2*w//3:]
+    mouth_std = float(mouth.std())
+    mouth_asym = abs(float(left_mouth.std()) - float(right_mouth.std()))
+
+    # 眼睛区域面积
+    upper = gray[:h//2, :]
+    eye_area = 0.0
+    if _lefteye_cascade is not None and _righteye_cascade is not None:
+        le = _lefteye_cascade.detectMultiScale(upper, 1.1, 3, minSize=(15, 10))
+        re = _righteye_cascade.detectMultiScale(upper, 1.1, 3, minSize=(15, 10))
+        if len(le) > 0 and len(re) > 0:
+            le_area = max(e[2]*e[3] for e in le)
+            re_area = max(e[2]*e[3] for e in re)
+            eye_area = float((le_area + re_area) / 2) / (w * h)
+
+    # 悲伤特征: 面部偏暗 + 眼睛偏小 + 嘴部活动少 + 低对比度
+    sad_score = 0
+    if fmean < 120:      sad_score += 1   # 面部较暗
+    if fstd < 30:         sad_score += 1   # 低对比度
+    if eye_area < 0.04:   sad_score += 1   # 眼睛偏小（半闭眼）
+    if mouth_std < 30:    sad_score += 1   # 嘴部不动
+    if mouth_asym > 5:    sad_score += 1   # 嘴角不对称
+
+    if sad_score >= 3:
+        conf = min(0.75, 0.40 + sad_score * 0.08)
+        return "sad", conf
+    return onnx_emotion, onnx_conf
+
+
 def detect_emotion_from_landmarks(face_img_rgb, frame_w, frame_h):
     # 深度学习模型优先（每5帧推理一次，其余用缓存）
     global _last_onnx_result, _onnx_frame_counter
     if _ort_session is not None:
         _onnx_frame_counter += 1
         if _onnx_frame_counter % 5 == 0:
-            _last_onnx_result = _onnx_predict_emotion(face_img_rgb)
+            raw_emotion, raw_conf = _onnx_predict_emotion(face_img_rgb)
+            # ONNX 后处理: 悲伤识别增强（AffectNet 悲伤样本偏少，模型易漏）
+            _last_onnx_result = _sadness_boost(raw_emotion, raw_conf, face_img_rgb)
         return _last_onnx_result
     """
     基于个人基线的表情识别 —— 相对变化远优于绝对阈值。
