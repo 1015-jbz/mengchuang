@@ -566,7 +566,7 @@ import re as _re, random as _random, datetime as _dt
 _deepseek_client = None
 
 def _get_deepseek():
-    """延迟初始化 DeepSeek 客户端（避免启动时阻塞）"""
+    """获取 DeepSeek 客户端（启动时预热，首次调用不额外耗时）"""
     global _deepseek_client
     if _deepseek_client is None:
         try:
@@ -574,8 +574,18 @@ def _get_deepseek():
             from openai import OpenAI
             _key = _os.getenv("DEEPSEEK_API_KEY")
             if _key:
-                _deepseek_client = OpenAI(api_key=_key, base_url="https://api.deepseek.com")
-                logger.info("DeepSeek 大模型已连接，对话将使用 AI 生成")
+                _deepseek_client = OpenAI(
+                    api_key=_key, base_url="https://api.deepseek.com",
+                    timeout=10.0, max_retries=1,
+                )
+                # 预热连接：发一个极短请求，让后续调用复用 HTTP 连接
+                try:
+                    _deepseek_client.chat.completions.create(
+                        model="deepseek-chat", messages=[{"role":"user","content":"hi"}],
+                        max_tokens=5, temperature=0,
+                    )
+                except: pass
+                logger.info("DeepSeek 大模型已连接并预热")
             else:
                 _deepseek_client = False
                 logger.warning("未设置 DEEPSEEK_API_KEY，使用本地模板回复")
@@ -873,6 +883,24 @@ def generate_reply(text, emotion="neutral"):
 # TTS 语音合成 — edge-tts 优先（8 种中文语音可选）→ pyttsx3 兜底
 # ═══════════════════════════════════════════════════════════
 
+# ── 后台 TTS 结果推送 ──
+def _update_pending_audio(path):
+    """后台线程回调：TTS 完成后将路径写入共享变量"""
+    global _pending_audio
+    if path:
+        with _audio_lock:
+            _pending_audio = path
+
+
+def get_pending_audio():
+    """定时器回调：有新音频时推送到前端"""
+    global _pending_audio
+    with _audio_lock:
+        path = _pending_audio
+        _pending_audio = None
+    return path if path else gr.skip()
+
+
 def tts_speak(text, voice_key=None, pitch="+0Hz", rate="+0%"):
     """合成语音文件并返回路径。edge-tts 2s 超时，超时/失败则 pyttsx3 兜底"""
     if not text:
@@ -986,7 +1014,12 @@ def process_text(text, chat_hist, voice_key, pitch_val, rate_val):
     except Exception as e:
         reply = f"抱歉，出错了: {e}"
 
-    audio_path = tts_speak(reply, voice_key, f"{pitch_val:+d}Hz", f"{rate_val:+d}%")
+    # TTS 后台合成，不阻塞文本回复（文字秒回，语音稍后自动播放）
+    threading.Thread(
+        target=lambda: _update_pending_audio(
+            tts_speak(reply, voice_key, f"{pitch_val:+d}Hz", f"{rate_val:+d}%")),
+        daemon=True
+    ).start()
 
     # Gradio 6.0 使用新格式
     chat_hist.append({"role": "user", "content": text})
@@ -1000,7 +1033,7 @@ def process_text(text, chat_hist, voice_key, pitch_val, rate_val):
             break
 
     status = f"意图: {intent} | 情绪: {EMOTION_ZH.get(emo, '?')}"
-    return chat_hist, status, audio_path
+    return chat_hist, status, None  # 音频由后台线程合成后经定时器推送到前端
 
 def process_audio(audio_path, chat_hist, voice_key, pitch_val, rate_val):
     """处理语音输入"""
@@ -1030,6 +1063,9 @@ if __name__ == "__main__":
     print("-" * 60)
     print("  打开浏览器: http://localhost:7860")
     print("=" * 60)
+
+    # 预热 DeepSeek 连接（让首次 API 调用复用已建立的 HTTPS 连接）
+    threading.Thread(target=_get_deepseek, daemon=True).start()
 
     # 启动摄像头采集线程
     if HAS_CV2 and _face_cascade is not None:
@@ -1154,6 +1190,10 @@ if __name__ == "__main__":
         emo_timer = gr.Timer(0.5)
         emo_timer.tick(fn=get_emotion_status,
                        outputs=[emotion_display, emotion_bar, status_box])
+
+        # 后台 TTS 音频推送
+        audio_timer = gr.Timer(0.3)
+        audio_timer.tick(fn=get_pending_audio, outputs=[voice_out])
 
     demo.launch(server_name="0.0.0.0", server_port=7860, share=False,
                 theme=gr.themes.Soft(), show_error=True)
