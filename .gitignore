@@ -38,3 +38,4 @@ data/vector_db/
 # Temp
 tmp/
 *.tmp
+.env

@@ -23,6 +23,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+# 加载 .env 中的环境变量（DeepSeek API Key）
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
 import numpy as np
 import gradio as gr
 
@@ -600,28 +604,29 @@ _LLM_SYSTEM_PROMPT = """你是"小航"，一个运行在智能汽车座舱里的
 6. 不要用 markdown 格式，纯文字回复"""
 
 
-def _llm_chat(user_text: str) -> str | None:
+def _llm_chat(user_text: str, emo_hint: str = "") -> str | None:
     """调用 DeepSeek 大模型生成回复，失败则返回 None 触发模板兜底"""
     client = _get_deepseek()
     if client is None:
         return None
     try:
         _llm_history.append({"role": "user", "content": user_text})
-        # 保留最近 16 轮对话（不含 system prompt）
-        ctx = _llm_history[-16:] if len(_llm_history) > 16 else _llm_history
-        messages = [{"role": "system", "content": _LLM_SYSTEM_PROMPT}] + ctx
+        ctx = _llm_history[-12:] if len(_llm_history) > 12 else _llm_history
+        messages = [{"role": "system", "content": _LLM_SYSTEM_PROMPT}]
+        if emo_hint:
+            messages.append({"role": "system", "content": emo_hint})
+        messages += ctx
         resp = client.chat.completions.create(
             model="deepseek-chat",
             messages=messages,
-            max_tokens=300,
-            temperature=0.8,
+            max_tokens=120,
+            temperature=0.6,
         )
         reply = resp.choices[0].message.content.strip()
         _llm_history.append({"role": "assistant", "content": reply})
         return reply
     except Exception as e:
         logger.warning(f"DeepSeek 调用失败: {e}，回退模板回复")
-        # 移除未配对的 user 消息以避免记忆污染
         if _llm_history and _llm_history[-1]["role"] == "user":
             _llm_history.pop()
         return None
@@ -795,16 +800,15 @@ def generate_reply(text, emotion="neutral"):
 
     # ── 优先: DeepSeek 大模型（真正理解语义，多轮记忆）──
     if t:
-        # 将情绪注入用户消息，让大模型感知
+        # 情绪作为 system 级提示注入，不污染用户原话
         emo_hint = {
-            "sad": "（驾驶员看起来有点难过）",
-            "angry": "（驾驶员有些烦躁）",
-            "fearful": "（驾驶员好像有点紧张）",
-            "tired": "（驾驶员看起来很疲惫）",
-            "happy": "（驾驶员心情不错）",
+            "sad": "[系统感知：驾驶员表情显示悲伤，请在回复中给予温暖安慰]",
+            "angry": "[系统感知：驾驶员表情显示愤怒，请帮助他冷静下来，把注意力放在安全驾驶上]",
+            "fearful": "[系统感知：驾驶员表情显示恐惧/紧张，请安抚情绪，强调安全]",
+            "tired": "[系统感知：驾驶员表情显示疲惫，请建议休息，提醒疲劳驾驶风险]",
+            "happy": "[系统感知：驾驶员心情不错，可以开朗活泼地回应]",
         }.get(emotion, "")
-        llm_input = f"{t}{emo_hint}" if emo_hint else t
-        llm_reply = _llm_chat(llm_input)
+        llm_reply = _llm_chat(t, emo_hint)
         if llm_reply:
             return llm_reply
 
