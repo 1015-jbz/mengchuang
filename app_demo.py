@@ -553,10 +553,78 @@ def transcribe(audio_path):
 # 对话引擎
 # ============================================================
 # ═══════════════════════════════════════════════════════════
-# 智能座舱对话引擎 "小航" — 多轮上下文 + 领域路由 + 情绪感知
+# 智能座舱对话引擎 "小航" — DeepSeek 大模型优先 + 模板兜底
 # ═══════════════════════════════════════════════════════════
 
 import re as _re, random as _random, datetime as _dt
+
+# ── DeepSeek 大模型客户端 ──
+_deepseek_client = None
+
+def _get_deepseek():
+    """延迟初始化 DeepSeek 客户端（避免启动时阻塞）"""
+    global _deepseek_client
+    if _deepseek_client is None:
+        try:
+            import os as _os
+            from openai import OpenAI
+            _key = _os.getenv("DEEPSEEK_API_KEY")
+            if _key:
+                _deepseek_client = OpenAI(api_key=_key, base_url="https://api.deepseek.com")
+                logger.info("DeepSeek 大模型已连接，对话将使用 AI 生成")
+            else:
+                _deepseek_client = False
+                logger.warning("未设置 DEEPSEEK_API_KEY，使用本地模板回复")
+        except Exception as e:
+            _deepseek_client = False
+            logger.warning(f"DeepSeek 初始化失败: {e}，使用本地模板回复")
+    return _deepseek_client if _deepseek_client is not False else None
+
+
+# ── 大模型对话记忆 ──
+_llm_history: list = []  # [{role, content}, ...]
+_LLM_SYSTEM_PROMPT = """你是"小航"，一个运行在智能汽车座舱里的 AI 助手。你的性格温暖、贴心、靠谱。
+
+核心设定：
+- 你运行在汽车本地芯片上，所有对话数据不会上传云端
+- 你能控制空调、车窗、座椅、灯光、导航、音乐等车载设备
+- 你时刻关注驾驶安全，察觉疲劳/分心时会主动提醒
+- 你能通过车内摄像头感知驾驶员的情绪，并做出相应关怀
+
+回复规则：
+1. 简短温暖——用户可能在开车，回复控制在一两句话内（除非用户要求详细说明）
+2. 安全第一——任何可能分散注意力的操作都提醒"安全驾驶"
+3. 情绪感知——察觉用户情绪低落时主动安慰，开心时一起开心
+4. 口语化自然——不要像机器人，像坐在副驾的朋友
+5. 如果用户说的跟驾驶/车辆无关，就用日常朋友聊天的语气回应
+6. 不要用 markdown 格式，纯文字回复"""
+
+
+def _llm_chat(user_text: str) -> str | None:
+    """调用 DeepSeek 大模型生成回复，失败则返回 None 触发模板兜底"""
+    client = _get_deepseek()
+    if client is None:
+        return None
+    try:
+        _llm_history.append({"role": "user", "content": user_text})
+        # 保留最近 16 轮对话（不含 system prompt）
+        ctx = _llm_history[-16:] if len(_llm_history) > 16 else _llm_history
+        messages = [{"role": "system", "content": _LLM_SYSTEM_PROMPT}] + ctx
+        resp = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=messages,
+            max_tokens=300,
+            temperature=0.8,
+        )
+        reply = resp.choices[0].message.content.strip()
+        _llm_history.append({"role": "assistant", "content": reply})
+        return reply
+    except Exception as e:
+        logger.warning(f"DeepSeek 调用失败: {e}，回退模板回复")
+        # 移除未配对的 user 消息以避免记忆污染
+        if _llm_history and _llm_history[-1]["role"] == "user":
+            _llm_history.pop()
+        return None
 
 # ── 对话上下文（简单短期记忆）──
 _dialog_memory = {"last_topic": None, "greeted": False, "turn": 0}
@@ -722,10 +790,25 @@ _REPLIES = {
 
 
 def generate_reply(text, emotion="neutral"):
-    """根据用户输入 + 情绪状态生成自然回复"""
+    """根据用户输入 + 情绪状态生成自然回复 — 优先 DeepSeek 大模型"""
     t = text.strip()
 
-    # ── 多轮上下文：续接上一轮话题 ──
+    # ── 优先: DeepSeek 大模型（真正理解语义，多轮记忆）──
+    if t:
+        # 将情绪注入用户消息，让大模型感知
+        emo_hint = {
+            "sad": "（驾驶员看起来有点难过）",
+            "angry": "（驾驶员有些烦躁）",
+            "fearful": "（驾驶员好像有点紧张）",
+            "tired": "（驾驶员看起来很疲惫）",
+            "happy": "（驾驶员心情不错）",
+        }.get(emotion, "")
+        llm_input = f"{t}{emo_hint}" if emo_hint else t
+        llm_reply = _llm_chat(llm_input)
+        if llm_reply:
+            return llm_reply
+
+    # ── 离线兜底: 模板引擎（无网络/API不可用时自动切换）──
     _dialog_memory["turn"] += 1
 
     # ── 意图路由 ──
