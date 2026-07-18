@@ -898,8 +898,8 @@ def process_text(text, chat_hist, voice_key, pitch_val, rate_val):
 
     # 找意图
     intent = "闲聊"
-    for (d, i), ks in INTENTS.items():
-        if any(k in text for k in ks):
+    for keywords, d, i in _ROUTES:
+        if any(k in text for k in keywords):
             intent = f"{d}/{i}"
             break
 
