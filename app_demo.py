@@ -813,21 +813,30 @@ def tts_speak(text, voice_key=None, pitch="+0Hz", rate="+0%"):
                 loop.close()
             if out_mp3.exists() and out_mp3.stat().st_size > 0:
                 mp3_ready[0] = True
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"edge-tts 语音合成失败: {e}")
 
     t = threading.Thread(target=_edge, daemon=True)
     t.start()
-    t.join(timeout=2.0)
+    t.join(timeout=4.0)  # 网络慢时 edge-tts 可能需 3-4 秒
 
     if mp3_ready[0]:
         return str(out_mp3)
 
-    # ── 兜底: pyttsx3 离线（稳定但语音角色少，全部声音相同）──
+    # ── 兜底: pyttsx3 离线（edge-tts 超时或失败时用）──
     try:
         out_wav = Path(tempfile.gettempdir()) / f"cockpit_tts_{stamp}.wav"
         import pyttsx3
         engine = pyttsx3.init()
+        voices = engine.getProperty('voices')
+        # 尝试根据语音角色匹配系统中文语音
+        male_keys = {"yunxia", "yunxi", "yunjian", "yunyang"}
+        if voice_key in male_keys:
+            target = next((v for v in voices if v.id != voices[0].id), None)
+        else:
+            target = voices[0] if voices else None
+        if target:
+            engine.setProperty('voice', target.id)
         engine.save_to_file(text, str(out_wav))
         engine.runAndWait()
         engine.stop()
