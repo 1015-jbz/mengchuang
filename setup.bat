@@ -24,37 +24,59 @@ if not exist ".venv" (
 )
 call .venv\Scripts\activate.bat
 
+:: 升级 pip
+echo [*] 升级 pip...
+python -m pip install --upgrade pip -i https://pypi.tuna.tsinghua.edu.cn/simple
+
 :: 安装依赖
-echo [*] 安装 Python 依赖...
-pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
-
-:: 检查模型文件
 echo.
-if not exist "models\enet_b2_7.onnx" (
-    echo [!] 表情识别模型未下载 (models\enet_b2_7.onnx)
-    echo    请从交接文档中获取下载方式
-) else (
-    echo [√] 表情识别模型就绪
+echo [*] 安装 Python 依赖（使用清华源加速）...
+pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+if %errorlevel% neq 0 (
+    echo [错误] 依赖安装失败，请检查网络或 requirements.txt
+    pause
+    exit /b 1
 )
+echo [√] Python 依赖已安装
 
-:: 检查 Whisper 模型
-if exist "D:\huggingface_cache\models--Systran--faster-whisper-tiny" (
-    echo [√] Whisper 语音模型就绪
+:: 下载 ONNX 表情识别模型（自动从 GitHub Release 下载）
+echo.
+echo [*] 下载 ONNX 表情识别模型（~30MB）...
+if not exist "models\enet_b2_7.onnx" (
+    python scripts\setup_models.py
+    if not exist "models\enet_b2_7.onnx" (
+        echo [警告] 自动下载失败，请参考 scripts\setup_models.py 中的手动方案
+    ) else (
+        echo [√] ONNX 模型下载完成
+    )
 ) else (
-    echo [!] Whisper 模型未下载，语音输入将降级为文本
-    echo    运行: python -c "from faster_whisper import WhisperModel; WhisperModel('tiny', device='cpu', compute_type='int8')"
+    echo [√] ONNX 表情识别模型已就绪
 )
 
 :: 检查 .env
+echo.
 if exist ".env" (
     echo [√] DeepSeek API Key 已配置
 ) else (
-    echo [!] 未配置 .env 文件，大模型对话将使用本地模板
-    echo    创建 .env 文件并写入: DEEPSEEK_API_KEY=你的key
+    echo [!] 未配置 .env 文件
+    echo    正在从 .env.example 复制模板...
+    if exist ".env.example" copy .env.example .env >nul
+    echo.
+    echo    请编辑 .env 文件，填入你的 DeepSeek API Key
+    echo    申请地址: https://platform.deepseek.com/api_keys
+    echo.
+    echo    未配置 key 也能运行，但智能对话会降级为本地模板回复
 )
 
 echo.
 echo ========================================
-echo   安装完成！双击 start.bat 启动
+echo   安装完成！
+echo.
+echo   下一步:
+echo     1. 编辑 .env 填入 DeepSeek API Key（可选）
+echo     2. 双击 start.bat 启动程序
 echo ========================================
+echo.
+echo Whisper 语音模型会在首次使用语音输入时自动下载（~75MB）
+echo.
 pause

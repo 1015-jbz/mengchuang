@@ -421,6 +421,16 @@ def _capture_loop():
         _video_running = False
         return
 
+    # 显式设置分辨率与帧率：降低 MJPEG 单帧体积与带宽，
+    # 缓解浏览器 <img> 标签软解码带来的卡顿（默认可能 1280x720@30fps）
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 480)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
+    cap.set(cv2.CAP_PROP_FPS, 20)
+    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    actual_fps = cap.get(cv2.CAP_PROP_FPS)
+    logger.info(f"摄像头分辨率: {actual_w}x{actual_h} @ {actual_fps:.0f}fps")
+
     logger.info("摄像头已连接，开始实时检测...")
     _video_cap = cap
     _video_running = True
@@ -490,8 +500,9 @@ def _capture_loop():
                 cv2.putText(annotated, label, (x+5, y-5),
                             font, scale, text_color, thick)
 
-        # 编码为 JPEG
-        _, jpeg = cv2.imencode('.jpg', annotated, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        # 编码为 JPEG — 质量 50 在 640x360 下画质损失不明显，
+        # 但单帧体积从 ~30KB 降到 ~15KB，显著降低浏览器软解码负担
+        _, jpeg = cv2.imencode('.jpg', annotated, [cv2.IMWRITE_JPEG_QUALITY, 50])
 
         with _lock:
             _latest_frame = jpeg.tobytes()
@@ -502,8 +513,9 @@ def _capture_loop():
 
 @flask_app.route('/video_feed')
 def video_feed():
-    """MJPEG 视频流端点"""
+    """MJPEG 视频流端点 — 输出帧率与摄像头采集帧率对齐，避免浏览器端预期与实际不符造成卡顿感"""
     def generate():
+        frame_interval = 1.0 / 20  # 20 FPS，与摄像头设置一致
         while True:
             with _lock:
                 frame = _latest_frame
@@ -512,16 +524,9 @@ def video_feed():
                 continue
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-            time.sleep(0.04)  # ~25 FPS
+            time.sleep(frame_interval)
 
     return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
-
-@flask_app.route('/emotion_status')
-def emotion_status():
-    """表情状态 JSON 端点"""
-    with _lock:
-        return {"emotion": _latest_emotion, "confidence": _latest_confidence,
-                "label": EMOTION_ZH.get(_latest_emotion, "未知")}
 
 # ============================================================
 # 语音识别（可选）
@@ -530,19 +535,24 @@ asr_model = None
 try:
     from faster_whisper import WhisperModel
     import os as _os
-    # 优先查 D 盘自定义路径（企业网 SSL 拦截导致正常下载失败，模型手动下载到 D 盘）
-    _whisper_path = "D:/huggingface_cache/models--Systran--faster-whisper-tiny/snapshots/tiny"
-    _cache_path = _os.path.expanduser("~/.cache/huggingface/hub/models--Systran--faster-whisper-tiny")
-    if _os.path.isdir(_whisper_path):
+    # 模型路径优先级：
+    #   1) 环境变量 WHISPER_MODEL_PATH（用户显式指定）
+    #   2) HuggingFace 默认缓存（首次运行时 faster-whisper 会自动下载 tiny 模型 ~75MB）
+    #   3) 仓库内 models/whisper-tiny（与 onnx 模型一起从 Release 下载）
+    _whisper_path = _os.environ.get("WHISPER_MODEL_PATH", "")
+    _local_repo_path = str(Path(__file__).resolve().parent / "models" / "whisper-tiny")
+    if _whisper_path and _os.path.isdir(_whisper_path):
         asr_model = WhisperModel(_whisper_path, device="cpu", compute_type="int8", local_files_only=True)
-        logger.info("faster-whisper 就绪 (D盘)")
-    elif _os.path.isdir(_cache_path):
-        asr_model = WhisperModel("tiny", device="cpu", compute_type="int8", local_files_only=True)
-        logger.info("faster-whisper 就绪 (C盘缓存)")
+        logger.info(f"faster-whisper 就绪 (WHISPER_MODEL_PATH={_whisper_path})")
+    elif _os.path.isdir(_local_repo_path):
+        asr_model = WhisperModel(_local_repo_path, device="cpu", compute_type="int8", local_files_only=True)
+        logger.info("faster-whisper 就绪 (本地 models/whisper-tiny)")
     else:
-        logger.info("Whisper 模型未缓存，语音识别使用文本降级")
-except Exception:
-    logger.info("语音识别使用文本降级模式")
+        # 让 faster-whisper 自动从 HuggingFace 下载（需要网络）
+        asr_model = WhisperModel("tiny", device="cpu", compute_type="int8")
+        logger.info("faster-whisper 就绪 (自动下载 tiny 模型)")
+except Exception as e:
+    logger.info(f"语音识别使用文本降级模式 ({e})")
 
 def transcribe(audio_path):
     if audio_path is None or asr_model is None:
@@ -1036,14 +1046,16 @@ def process_text(text, chat_hist, voice_key, pitch_val, rate_val):
     return chat_hist, status, None  # 音频由后台线程合成后经定时器推送到前端
 
 def process_audio(audio_path, chat_hist, voice_key, pitch_val, rate_val):
-    """处理语音输入"""
+    """处理语音输入 — 处理完后清空 mic 组件，让用户能立即录下一条"""
     chat_hist = chat_hist or []
     if audio_path is None:
-        return chat_hist, "", None
+        return chat_hist, "", None, None
     text = transcribe(audio_path)
     if not text:
-        return chat_hist, "(未识别到语音)", None
-    return process_text(text, chat_hist, voice_key, pitch_val, rate_val)
+        return chat_hist, "(未识别到语音)", None, None
+    chat_hist, status, _ = process_text(text, chat_hist, voice_key, pitch_val, rate_val)
+    # 第 4 个返回值清空 mic 组件，使其回到"可录音"状态
+    return chat_hist, status, None, None
 
 # ============================================================
 # 启动
@@ -1077,7 +1089,8 @@ if __name__ == "__main__":
     if HAS_FLASK:
         flask_thread = threading.Thread(
             target=lambda: flask_app.run(host='0.0.0.0', port=7861,
-                                         debug=False, use_reloader=False),
+                                         debug=False, use_reloader=False,
+                                         threaded=True),
             daemon=True
         )
         flask_thread.start()
@@ -1095,14 +1108,16 @@ if __name__ == "__main__":
                 gr.Markdown("### 实时表情识别")
 
                 if HAS_FLASK:
-                    # 直接嵌入 MJPEG 流。src 用页面自身的 hostname 拼接，
-                    # 避免硬编码 localhost 导致手机/投屏等外部设备访问时视频黑屏
+                    # 直接嵌入 MJPEG 流。Gradio 6 的 gr.HTML 通过 innerHTML 注入，
+                    # 不会执行 <script> 标签，因此用 <img> 的 onload/onerror 属性来动态设 src。
+                    # 数据属性 data-src-host 占位，onload 时拼接真实 URL，避开 invalid:// hack。
                     gr.HTML("""
-                    <div style="border:2px solid #00d4aa; border-radius:10px; overflow:hidden; background:#000;">
-                        <img src="invalid://bootstrap" style="width:100%; display:block;"
-                             onerror="if(!this.dataset.boot){this.dataset.boot=1;this.src=location.protocol+'//'+location.hostname+':7861/video_feed';}else{this.onerror=null;this.parentElement.innerHTML='<p style=color:red;padding:20px;>摄像头未就绪，请确认摄像头已连接</p>';}">
+                    <div id="video-box" style="border:2px solid #00d4aa; border-radius:10px; overflow:hidden; background:#000;">
+                        <img id="cockpit-video" style="width:100%; display:block;" alt="实时视频流"
+                             src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
+                             onload="if(!this.dataset.loaded){this.dataset.loaded='1';this.onerror=function(){document.getElementById('video-box').innerHTML='<p style=color:red;padding:20px;text-align:center;>摄像头未就绪，请确认摄像头已连接</p>';};this.src=location.protocol+'//'+location.hostname+':7861/video_feed';}" />
                     </div>
-                    <p style="text-align:center;color:#888;font-size:12px;">MJPEG 实时流 · 25 FPS</p>
+                    <p style="text-align:center;color:#888;font-size:12px;">MJPEG 实时流 · 20 FPS</p>
                     """)
                 else:
                     gr.Markdown("*视频流不可用 (Flask 未安装)*")
@@ -1175,7 +1190,7 @@ if __name__ == "__main__":
                    outputs=[chatbot, status_line, voice_out]).then(
                    lambda: "", outputs=[txt])
         mic.stop_recording(fn=process_audio, inputs=[mic, chatbot, voice_selector, pitch_slider, rate_slider],
-                           outputs=[chatbot, status_line, voice_out])
+                           outputs=[chatbot, status_line, voice_out, mic])
 
         # 风格预设 → 一键设滑块
         def _apply_preset(preset_name):
